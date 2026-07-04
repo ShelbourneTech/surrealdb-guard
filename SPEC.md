@@ -90,7 +90,7 @@ Groups and grants are stored in the database itself (§8), not in the proxy's co
              ▼
   ┌──────────────────────────────────────────────────────┐
   │  surrealdb-guard  (daemon, typically root-owned)     │
-  │  Python / asyncio                                    │
+  │  Go                                                  │
   │                                                       │
   │  - One socket per identity; identity = socket path    │
   │  - Tier config from a root-owned config file         │
@@ -114,7 +114,7 @@ Groups and grants are stored in the database itself (§8), not in the proxy's co
 
 **Why the daemon talks HTTP to SurrealDB rather than something more exotic:** the socket's only job is establishing caller identity for the hop that otherwise has none (an OS shell has no notion of "which identity" beyond its own UID); SurrealDB's HTTP API is simply the transport SurrealDB itself speaks. The proxy authenticates to SurrealDB under its own two service credentials (§7.2) and never carries the caller's identity across that hop — enforcement happens entirely on the socket side.
 
-**Why the proxy needs to run with elevated privilege:** creating sockets owned by multiple different Unix groups requires it. The proxy performs no other privileged operation — all request handling is ordinary asyncio, and SurrealDB access is over plain HTTP to a service the proxy doesn't otherwise control.
+**Why the proxy needs to run with elevated privilege:** creating sockets owned by multiple different Unix groups requires it. The proxy performs no other privileged operation — all request handling is ordinary goroutine-per-connection concurrency, and SurrealDB access is over plain HTTP to a service the proxy doesn't otherwise control.
 
 ## 6. Protocol
 
@@ -255,13 +255,20 @@ DELETE _access_grant WHERE username = "carol" AND group_name = "reports";
 
 **A known rough edge:** Unix usernames appear as plain strings in `_access_grant` rows, so removing or renaming an identity in `config.yml` leaves orphaned rows behind. This is benign by construction — an orphaned grant matches no live socket, so it's simply inert — but it is drift, and the proxy logs orphaned rows as warnings on each reload rather than silently ignoring them. See §16 for a dedicated cleanup tool as a candidate addition.
 
-## 9. Client library
+## 9. Client libraries
 
-An ordinary importable Python module, `surrealdb_guard.client`, exposing a client class with one method per protocol method (§6.3). It connects to a Unix socket whose default path is derived from the calling process's own username (`/run/surrealdb-guard/$USER.sock`), with an environment variable override for tests and non-standard setups. The client lives in the same package as the server, so the wire protocol and its one reference consumer evolve together; the protocol itself (§6) is documented well enough that other languages can implement their own client without depending on this package.
+Two reference clients ship as part of this project, both exposing one method per protocol method (§6.3) and both connecting to a Unix socket whose default path is derived from the calling process's own username (`/run/surrealdb-guard/$USER.sock`), with an environment variable override for tests and non-standard setups:
+
+- **Go**, package `surrealdb_guard/client`, in the same module as the daemon. This is the primary reference implementation: since it lives alongside the server, the wire protocol and this client evolve together and it is the first to reflect any protocol change. The CLI (§10) is built on top of it.
+- **Python**, package `surrealdb_guard_client` (name TBD, distributed separately, e.g. via PyPI), for identities and services that are themselves Python — the common case of a Python-based script, service, or agent that needs to reach the proxy without shelling out to the Go CLI.
+
+Both clients are thin: connect, encode a request per §6.2, write the line, read and decode the response line, surface `error.code`/`error.message` as a typed exception/error value. Neither client contains any policy logic — enforcement is entirely server-side — so keeping the two in sync is a matter of matching the protocol schema, not replicating behavior.
+
+The protocol itself (§6) is documented well enough that a client in any other language can be implemented without depending on either of these packages; the Go and Python clients are the two this project maintains, not the only two that can exist.
 
 ## 10. Command-line interface
 
-A minimal CLI ships with the package: it reads SurrealQL (for `query`) or a JSON request body (for typed writes and `dba_execute`) from argv or stdin, and prints the JSON response. This is the primary hand-verification tool for any deployment — confirming a grant took effect, or that a write is correctly denied, is a single command rather than something that requires writing a throwaway script.
+A minimal CLI ships as part of the Go module, built on the Go client (§9): it reads SurrealQL (for `query`) or a JSON request body (for typed writes and `dba_execute`) from argv or stdin, and prints the JSON response. Shipping it as a single Go binary means it can be dropped onto a host and run with no runtime dependencies (no interpreter, no virtualenv). This is the primary hand-verification tool for any deployment — confirming a grant took effect, or that a write is correctly denied, is a single command rather than something that requires writing a throwaway script.
 
 An interactive REPL (statement history, completion, routing simple writes to the right typed method) is deliberately deferred — see §16.
 
@@ -277,13 +284,14 @@ Everything else — how identities are provisioned, how `config.yml` gets render
 
 ## 12. Testing strategy
 
-Three layers, escalating in fidelity; only the last needs a real multi-user host, and none of them requires a privileged or long-lived daemon on a developer's own machine:
+Four layers, escalating in fidelity; only the multi-user layer needs a real multi-user host, and none of them requires a privileged or long-lived daemon on a developer's own machine:
 
-1. **Unit tests (runnable anywhere, no root, no SurrealDB).** Unix sockets are ordinary files: the suite starts the proxy in-process, binding sockets under a pytest temp directory under the developer's own UID. SurrealDB is replaced with a mocked HTTP transport. This layer covers the protocol (framing, error mapping), the entire policy algebra (tier semantics, grant unions, multi-target checks, the `dba_execute` keyword screen, condition compilation), and config loading.
+1. **Unit tests (runnable anywhere, no root, no SurrealDB).** Unix sockets are ordinary files: the Go test suite starts the proxy in-process, binding sockets under a per-test temp directory (`t.TempDir()`) under the developer's own UID. SurrealDB is replaced with a mocked HTTP transport (`net/http/httptest`). This layer covers the protocol (framing, error mapping), the entire policy algebra (tier semantics, grant unions, multi-target checks, the `dba_execute` keyword screen, condition compilation), and config loading. The Go client also has its own unit tests (encode/decode, error mapping) run against a fake socket listener rather than a full proxy instance.
 2. **Local integration tests (still unprivileged).** SurrealDB's own in-memory single-process mode (`surreal start memory`) runs as a plain, disposable, user-owned process on a random localhost port. This layer exercises real query execution, read-only-credential RBAC (including a standing regression check that the read-only role truly can't write — see §13's caveat), and bound-parameter behaviour.
 3. **Multi-user host tests (needs a disposable VM or container with real separate OS users).** The pieces the first two layers can't reach — root-owned sockets across genuinely different Unix users, service-manager ordering, `tmpfiles`-style directory setup — are validated here. This is the only layer that needs anything resembling a deployment, and it should be fully disposable (a throwaway container or VM, torn down after the run).
+4. **Cross-client conformance (unprivileged, any layer above a running proxy).** Because the Go and Python clients are independent implementations of the same protocol (§9), both are run against the same live proxy instance (in-process for layer 1, or the layer-2 setup) exercising the identical matrix of calls, asserting identical results. This catches drift between the two clients directly, rather than relying on each client's own unit tests to indirectly agree with each other.
 
-A standing validation harness (a script exercising the full tier × operation matrix — reads, granted writes, denied writes, `dba_execute` allow/deny, identity-management-statement rejection) should accompany the project and be runnable against any of the three layers above.
+A standing validation harness (a script exercising the full tier × operation matrix — reads, granted writes, denied writes, `dba_execute` allow/deny, identity-management-statement rejection) should accompany the project and be runnable against any of the four layers above.
 
 ## 13. SurrealDB version compatibility
 
