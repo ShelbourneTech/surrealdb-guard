@@ -13,6 +13,8 @@ https://surrealdb.com/docs/reference/query-language/statements/alter/user.
 
 A `dba`-tier caller could run `ALTER USER` to change the proxy's own credentials' roles or password without ever tripping the keyword screen. The reject list (Appendix C.2) needs at minimum `ALTER USER`, and the 3.x grammar should be audited for `ALTER ACCESS` and any other identity-adjacent `ALTER` forms. The screen appears to have been derived from the 2.x-era statement set (§6 still cites "confirmed against the SurrealDB v2.3.3 grammar") while the version pin (§13) is 3.1.5 — the two need to be reconciled.
 
+<!--Add the missing item-->
+
 ### 2. `_access_*` tables are writable by the `writer` tier via typed writes
 
 §8 states these tables are "writable only through `dba_execute`," but §6.3 says `writer`/`dba` tiers "skip the group check entirely" for all typed writes. Nothing in the spec enforces the §8 claim — a `writer`-tier identity can `create`/`update`/`delete` an `_access_grant` row directly through the typed write surface, i.e. perform access management from a non-`dba` tier.
