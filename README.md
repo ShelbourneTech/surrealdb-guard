@@ -104,3 +104,38 @@ Layer 1 unit tests live alongside the code they test (`*_test.go`, `tests/test_*
 |---|---|---|
 | `ci.yml` | Push, pull request | Build, unit tests (Go + Python), integration tests (SurrealDB service container), linting (`golangci-lint`, `ruff`) |
 | `release.yml` | Tag push (`v*`) | Build static binaries for Linux amd64/arm64, publish to GitHub Releases; publish Python client to PyPI |
+
+---
+
+## Platform notes
+
+- The **daemon runs on Linux only** (requires systemd, `tmpfiles.d`, `/run`).
+- **macOS developers** can run test layers 1, 2, and 4 natively. Layer 3 (multi-user host tests) requires Linux; use a disposable Podman container rather than your host.
+- **Windows** is out of scope.
+
+---
+
+## Reference links
+
+### Upstream SurrealDB issues motivating this project
+
+- [`surrealdb/surrealdb#1614`](https://github.com/surrealdb/surrealdb/issues/1614) — Unix-socket transport (open since January 2023). If this ships, re-evaluate whether the proxy's identity mechanism still needs to differ.
+- [`surrealdb/surrealdb#7092`](https://github.com/surrealdb/surrealdb/issues/7092) — Table-level `DEFINE USER` permissions (open). If this ships, re-evaluate the proxy's reason for existing.
+
+### Security advisory
+
+- [`GHSA-4vgr-h27g-cf9p`](https://github.com/advisories/GHSA-4vgr-h27g-cf9p) — HTTP RPC Session Race Condition / Privilege Escalation in SurrealDB. This advisory does **not** apply to deployments using this proxy with SurrealDB ≥ 3.1.5 (the minimum required version — see SPEC §13).
+
+### SurrealDB documentation
+
+- [REST API reference](https://surrealdb.com/docs/surrealdb/integration/http) — `/sql` and `/rpc` endpoints used by the proxy.
+- [Authentication & users](https://surrealdb.com/docs/surrealdb/security/authentication) — `OWNER`/`EDITOR`/`VIEWER` system-user roles.
+- [SurrealQL reference](https://surrealdb.com/docs/surrealql) — grammar reference for the target SurrealDB version; relevant to the `dba_execute` keyword screen (SPEC Appendix C) and record-ID syntax (SPEC Appendix A).
+
+### Reference implementation
+
+- [`github.com/surrealdb/surrealdb.go`](https://github.com/surrealdb/surrealdb.go) — the official Go SurrealDB client. Useful as a reference for HTTP wire behaviour. The proxy hand-rolls its own HTTP client to keep the dependency tree tight (SPEC §14).
+
+### Python client naming
+
+The Python client is published to PyPI as **`surrealdb-guard-client`** and imported as **`surrealdb_guard_client`** — the standard Python packaging convention (hyphenated distribution name, underscored import name). Install with `pip install surrealdb-guard-client`.

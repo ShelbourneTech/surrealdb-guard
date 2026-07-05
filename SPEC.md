@@ -98,7 +98,6 @@ Groups and grants are stored in the database itself (§8), not in the proxy's co
   │  - reads  → arbitrary SurrealQL, read-only credential │
   │  - writes → typed ops, policy check, read-write cred. │
   │  - dba_execute → arbitrary SurrealQL (dba tier only)  │
-  │  - Structured log line per call                       │
   └──────────────────────────────────────────────────────┘
              │
              │  HTTP (loopback or private network)
@@ -116,6 +115,8 @@ Groups and grants are stored in the database itself (§8), not in the proxy's co
 
 **Why the proxy needs to run with elevated privilege:** creating sockets owned by multiple different Unix groups requires it. The proxy performs no other privileged operation — all request handling is ordinary goroutine-per-connection concurrency, and SurrealDB access is over plain HTTP to a service the proxy doesn't otherwise control.
 
+**Road not taken — `SO_PEERCRED` / `getpeereid()`:** the conventional Unix identity mechanism for a shared socket is `SO_PEERCRED` (Linux) or `getpeereid()` (BSD/macOS): a single socket accepts connections from all callers, and the daemon calls `getsockopt(SO_PEERCRED)` on each accepted connection to learn the connecting UID/GID. This approach is used by systemd's socket activation, PostgreSQL's `unix_socket_permissions`, Docker's socket group, and similar infrastructure. It is equivalent in security to the one-socket-per-identity approach taken here. The reason for the deviation: with `SO_PEERCRED`, the identity of an accepted connection is determined by a syscall that **must not be forgotten or incorrectly skipped** in the request-handling path. The one-socket-per-identity approach makes identity a structural property of which socket file was connected to — the identity is established at `accept()`, before any application code runs, and there is no code path in which it could be omitted. The tradeoff is a more complex socket lifecycle (create, `chown`, permission-assert, tear down per identity) in exchange for eliminating the possibility of a handler goroutine that silently skips the credential check.
+
 ## 6. Protocol
 
 The proxy speaks a small line-delimited JSON-RPC protocol over each socket: one JSON object per request line, one per response line. No streaming, no multiplexing.
@@ -128,7 +129,9 @@ The proxy speaks a small line-delimited JSON-RPC protocol over each socket: one 
 
 ### 6.1 Transport and framing
 
-Unix domain socket, `SOCK_STREAM`. Each request and response is exactly one JSON object followed by a newline. No fragmentation handling beyond standard newline-delimited buffering is required in v1.
+Unix domain socket, `SOCK_STREAM`. Each request and response is exactly one JSON object followed by a newline (`\n`). No fragmentation handling beyond standard newline-delimited buffering is required in v1.
+
+**Protocol framing:** the proxy uses **JSON-RPC 2.0** as its framing standard. Every request must include `"jsonrpc": "2.0"` and a non-null `"id"`. Every response includes `"jsonrpc": "2.0"` and echoes the same `"id"`. This aligns the framing with a well-known, widely-understood standard and gives every language ecosystem at least one off-the-shelf JSON-RPC library to build on; SurrealDB's existing clients using `ws://`/`http://` URLs are still not directly usable because they do not support Unix-domain-socket transport (§6, reason 1).
 
 ### 6.2 Request/response schema
 
@@ -136,18 +139,24 @@ Unix domain socket, `SOCK_STREAM`. Each request and response is exactly one JSON
 
 ```json
 {
+  "jsonrpc": "2.0",
   "id": "<string — caller-chosen, echoed back>",
   "method": "<query | create | update | upsert | delete | insert | relate | dba_execute>",
   "params": { ... }
 }
 ```
 
-**Response (success):** `{"id": "...", "result": [ ... ]}`
+**Response (success):**
+
+```json
+{ "jsonrpc": "2.0", "id": "...", "result": [ ... ] }
+```
 
 **Response (error):**
 
 ```json
 {
+  "jsonrpc": "2.0",
   "id": "<same as request>",
   "error": {
     "code": "<DENIED | DB_ERROR | INVALID_PARAMS | UNKNOWN_METHOD>",
@@ -155,6 +164,23 @@ Unix domain socket, `SOCK_STREAM`. Each request and response is exactly one JSON
   }
 }
 ```
+
+**`result` shape per method:**
+
+The `result` field is always an array. Its contents depend on the method:
+
+| Method | `result` contents |
+|---|---|
+| `query` | An array of statement results, each `{"status": "OK"\|"ERR", "time": "<duration>", "result": <value>}` — SurrealDB's `/sql` response format passed through verbatim. Multi-statement SurrealQL produces multiple array entries, one per statement. |
+| `create` | A single-element array containing the created record object (SurrealDB's `/rpc` `create` response). |
+| `update` | An array of updated record objects (one per affected record). |
+| `upsert` | A single-element array containing the upserted record object. |
+| `delete` | An array of deleted record objects (one per deleted record). |
+| `insert` | An array of inserted record objects (one per inserted row). |
+| `relate` | A single-element array containing the created edge record. |
+| `dba_execute` | Same shape as `query` — an array of statement results in SurrealDB's `/sql` format. |
+
+**Empty result arrays** (`[]`) are valid and indicate zero rows were affected (e.g. a `delete` where the `where` condition matched nothing). They are not errors.
 
 ### 6.3 Methods
 
@@ -182,6 +208,17 @@ The protocol never interpolates a caller-supplied string into the SurrealQL it c
 - **Targets** (`target`/`targets`) must match a strict grammar — a bare table identifier or a record ID — validated before use. Anything else is `INVALID_PARAMS`.
 - **`content`/`values`** travel as bound parameters in the request body to SurrealDB's `/rpc` endpoint; the proxy constructs the statement text itself and never treats caller data as anything but a typed, bound value. This applies even to schemaless (`SCHEMALESS`) tables: a caller with write access can set arbitrary field names via `content`, exactly as with a hand-written statement — field-level restriction is explicitly out of scope for this tool (§2), so that's expected, not a gap.
 - **`where`** accepts a structured condition object (field paths, comparison/containment operators, parameter-bound values), which the proxy compiles into a `WHERE` clause itself. The condition grammar is deliberately small. When selection logic needs more than it expresses, the idiom is **read-then-write-by-ID**: resolve the record set with a full-SurrealQL `query` call (read-only credential, so any write hiding in a subquery is rejected by the database itself), then issue the typed write against the explicit record IDs returned. This two-step is not transactional (§16 lists a batched `transact` operation as a way to close that gap later).
+
+**`insert` semantics:** `insert` maps to SurrealDB's `INSERT INTO <table> <values>`. The `values` field is an array of content objects; the proxy forwards them as a single bulk `INSERT` under a bound parameter. `INSERT INTO ... ON DUPLICATE KEY UPDATE` (upsert-on-conflict) is **not** exposed through this method — callers that need upsert semantics should use `upsert`. Duplicate-ID conflicts on a plain `insert` surface as a `DB_ERROR`.
+
+**`upsert` semantics:** `upsert` maps to SurrealDB's `UPSERT <target> CONTENT <content>`. The `mode` parameter controls the merge behaviour:
+
+| `mode` | SurrealDB statement | Effect |
+|---|---|---|
+| `replace` (default) | `UPSERT <target> CONTENT <content>` | Replaces the entire record if it exists; creates it if not. |
+| `merge` | `UPSERT <target> MERGE <content>` | Merges the supplied fields into the existing record (existing fields not in `content` are preserved). |
+
+Conditional forms (`UPSERT ... WHERE ...`) are not exposed in v1. If conditional upsert logic is required, use the read-then-write-by-ID idiom: resolve the record set with a `query`, then `upsert` by explicit record ID.
 
 `RELATE` writes only the edge record (endpoints are referenced, not modified — the proxy still checks all three tables involved, conservatively). Schema-defined machinery such as `DEFINE EVENT` or `DEFINE FIELD ... VALUE` can cause one statement to write other tables as a side effect — acceptable, because defining such machinery is itself a `dba_execute`-gated act.
 
@@ -230,10 +267,12 @@ Two tables, prefixed `_access_` to mark them as belonging to the access-control 
 DEFINE TABLE IF NOT EXISTS _access_group SCHEMAFULL;
 DEFINE FIELD name   ON _access_group TYPE string;
 DEFINE FIELD tables ON _access_group TYPE array<string>;
+DEFINE INDEX IF NOT EXISTS access_group_name ON _access_group FIELDS name UNIQUE;
 
 DEFINE TABLE IF NOT EXISTS _access_grant SCHEMAFULL;
 DEFINE FIELD username   ON _access_grant TYPE string;
 DEFINE FIELD group_name ON _access_grant TYPE string;
+DEFINE INDEX IF NOT EXISTS access_grant_username ON _access_grant FIELDS username;
 ```
 
 This DDL is fixed and identical for every deployment — it's the proxy's own bookkeeping state, not something each adopter should have to hand-copy from documentation. The proxy ships an idempotent schema-initialization step (a CLI subcommand and/or a startup check) that issues this DDL under the read-write credential. These two tables are readable by everyone (like all tables, via `query`) and writable only through `dba_execute`.
@@ -255,12 +294,24 @@ DELETE _access_grant WHERE username = "carol" AND group_name = "reports";
 
 **A known rough edge:** Unix usernames appear as plain strings in `_access_grant` rows, so removing or renaming an identity in `config.yml` leaves orphaned rows behind. This is benign by construction — an orphaned grant matches no live socket, so it's simply inert — but it is drift, and the proxy logs orphaned rows as warnings on each reload rather than silently ignoring them. See §16 for a dedicated cleanup tool as a candidate addition.
 
+**Reload semantics for in-flight requests and structural changes:**
+
+A reload is triggered by SIGHUP, the periodic timer, or the post-`dba_execute` hook. The following rules govern edge cases:
+
+| Event | Behaviour |
+|---|---|
+| An identity is removed from `config.yml` on reload | Its socket is closed and removed from the listening set. In-flight requests on that socket (i.e. requests already accepted and dispatched to a goroutine before the reload) complete normally; the socket is not torn down until the goroutine returns. New `connect()` calls on the old socket path fail at the kernel level once the socket file is removed. |
+| `socket_dir` changes on reload | **Fail the reload loudly; do not hot-swap.** A `socket_dir` change requires a restart. The proxy logs an error and continues serving under the original `socket_dir`. |
+| A tier changes for an existing identity on reload | The new tier takes effect for all new requests on that identity's socket after the reload completes. In-flight requests that were already dispatched (accepted from the socket, goroutine started) complete under the tier that was in effect when the request was accepted. |
+| Groups or grants change (via `dba_execute` path or out-of-band) | The in-memory cache is atomically swapped at the point the reload completes. In-flight requests complete under the cache version that was current when they started (the goroutine holds a snapshot reference). |
+| A `config.yml` parse error on reload | The reload is aborted entirely; the previous config remains active. The error is logged at error level. No sockets are changed. |
+
 ## 9. Client libraries
 
 Two reference clients ship as part of this project, both exposing one method per protocol method (§6.3) and both connecting to a Unix socket whose default path is derived from the calling process's own username (`/run/surrealdb-guard/$USER.sock`), with an environment variable override for tests and non-standard setups:
 
 - **Go**, package `surrealdb_guard/client`, in the same module as the daemon. This is the primary reference implementation: since it lives alongside the server, the wire protocol and this client evolve together and it is the first to reflect any protocol change. The CLI (§10) is built on top of it.
-- **Python**, package `surrealdb_guard_client` (name TBD, distributed separately, e.g. via PyPI), for identities and services that are themselves Python — the common case of a Python-based script, service, or agent that needs to reach the proxy without shelling out to the Go CLI.
+- **Python**, package `surrealdb_guard_client` (import name), distributed via PyPI as `surrealdb-guard-client` (distribution name). This dash-vs-underscore split is standard Python packaging convention: PyPI distribution names use hyphens, import names use underscores. `pip install surrealdb-guard-client` installs a package that callers import as `import surrealdb_guard_client`. The `client-python/` directory in the repository uses a hyphenated name by convention; the `pyproject.toml` `[project] name` field is `surrealdb-guard-client`.
 
 Both clients are thin: connect, encode a request per §6.2, write the line, read and decode the response line, surface `error.code`/`error.message` as a typed exception/error value. Neither client contains any policy logic — enforcement is entirely server-side — so keeping the two in sync is a matter of matching the protocol schema, not replicating behavior.
 
@@ -287,21 +338,30 @@ Everything else — how identities are provisioned, how `config.yml` gets render
 Four layers, escalating in fidelity; only the multi-user layer needs a real multi-user host, and none of them requires a privileged or long-lived daemon on a developer's own machine:
 
 1. **Unit tests (runnable anywhere, no root, no SurrealDB).** Unix sockets are ordinary files: the Go test suite starts the proxy in-process, binding sockets under a per-test temp directory (`t.TempDir()`) under the developer's own UID. SurrealDB is replaced with a mocked HTTP transport (`net/http/httptest`). This layer covers the protocol (framing, error mapping), the entire policy algebra (tier semantics, grant unions, multi-target checks, the `dba_execute` keyword screen, condition compilation), and config loading. The Go client also has its own unit tests (encode/decode, error mapping) run against a fake socket listener rather than a full proxy instance.
-2. **Local integration tests (still unprivileged).** SurrealDB's own in-memory single-process mode (`surreal start memory`) runs as a plain, disposable, user-owned process on a random localhost port. This layer exercises real query execution, read-only-credential RBAC (including a standing regression check that the read-only role truly can't write — see §13's caveat), and bound-parameter behaviour.
+2. **Local integration tests (still unprivileged).** SurrealDB's own in-memory single-process mode (`surreal start memory`) runs as a plain, disposable, user-owned process on a random localhost port. This layer exercises real query execution, read-only-credential RBAC (including a standing regression check that the read-only role truly can't write — see §13's caveat), and bound-parameter behaviour. It also includes a **standing concurrency cross-contamination probe** that hammers concurrent `query` (VIEWER credential) and typed-write (OWNER credential) requests and asserts that no `query` response contains data that could only have been produced under the OWNER session. This probe directly regresses the class of bug described in `GHSA-4vgr-h27g-cf9p` and must remain green across every SurrealDB version the project supports.
 3. **Multi-user host tests (needs a disposable VM or container with real separate OS users).** The pieces the first two layers can't reach — root-owned sockets across genuinely different Unix users, service-manager ordering, `tmpfiles`-style directory setup — are validated here. This is the only layer that needs anything resembling a deployment, and it should be fully disposable (a throwaway container or VM, torn down after the run).
 4. **Cross-client conformance (unprivileged, any layer above a running proxy).** Because the Go and Python clients are independent implementations of the same protocol (§9), both are run against the same live proxy instance (in-process for layer 1, or the layer-2 setup) exercising the identical matrix of calls, asserting identical results. This catches drift between the two clients directly, rather than relying on each client's own unit tests to indirectly agree with each other.
 
 A standing validation harness (a script exercising the full tier × operation matrix — reads, granted writes, denied writes, `dba_execute` allow/deny, identity-management-statement rejection) should accompany the project and be runnable against any of the four layers above.
 
+**Platform contract:** the daemon runs on **Linux only** (requires systemd, `tmpfiles.d`, `/run`). Test layers 1, 2, and 4 are portable and run on macOS and Linux. Layer 3 (multi-user host) requires Linux; macOS developers should use a disposable container via Podman (see §5 resource notes) rather than running layer-3 tests on their host. Windows is out of scope.
+
 ## 13. SurrealDB version compatibility
 
-The proxy talks to SurrealDB over its stable HTTP surface (`/sql` for `query`/`dba_execute`, the stateless `/rpc` endpoint for bound-parameter typed writes), which is expected to remain compatible across SurrealDB 2.x and 3.x. Two version-specific things need explicit, version-pinned verification rather than an assumption that they "still work":
+**Minimum supported version: SurrealDB 3.1.5.**
 
-- **The read-only role must actually be read-only.** Verify with a clean, hand-crafted probe (fresh credentials, explicit response assertions, including a write hidden in a subquery) against every SurrealDB version this project claims to support, and keep that probe as a standing regression check — don't rely on documentation alone.
+SurrealDB 3.1.5 is the minimum required version. This pin exists primarily to exclude all versions affected by `GHSA-4vgr-h27g-cf9p` (HTTP RPC Session Race Condition / Privilege Escalation — see `https://github.com/advisories/GHSA-4vgr-h27g-cf9p`). That advisory describes a race condition in the HTTP `/rpc` handler where concurrent requests can share mutable authentication state, causing an unauthenticated request to execute under an authenticated session's privileges. The proxy's design — two credentials (`OWNER` and `VIEWER`) making concurrent calls against the same SurrealDB instance — is precisely the scenario the advisory describes. SurrealDB 3.1.5 contains the fix; no version below it is supported for use with this proxy.
+
+The proxy talks to SurrealDB over its stable HTTP surface (`/sql` for `query`/`dba_execute`, the stateless `/rpc` endpoint for bound-parameter typed writes). This surface is expected to remain compatible across SurrealDB 3.x. Two version-specific things need explicit, version-pinned verification rather than an assumption that they "still work":
+
+- **The read-only role must actually be read-only.** Verify with a clean, hand-crafted probe (fresh credentials, explicit response assertions, including a write hidden in a subquery) against every SurrealDB version this project claims to support, and keep that probe as a standing regression check — don't rely on documentation alone. A standing concurrency cross-contamination probe (§12, layer 2) must also continuously hammer concurrent `query` (VIEWER) and typed-write (OWNER) requests and assert no cross-contamination; this directly regresses `GHSA-4vgr-h27g-cf9p`'s class of bug.
 - **SurrealDB 3.x's `--deny-arbitrary-query` flag does not replace this proxy.** It's group-granular (`guest`/`record`/`system`), not per-user, so it cannot distinguish the proxy's own credential from any other system user without also blocking every other system user (including whatever holds schema authority). `DEFINE API` (3.x) likewise doesn't solve the caller-identity problem this proxy solves, because SurrealDB still has no Unix-socket transport (`surrealdb/surrealdb#1614`) and therefore no kernel-attested identity to branch enforcement on inside a `DEFINE API` endpoint — the credential is just a string in the caller's environment. Both are worth revisiting if upstream ever ships per-user query capabilities or a Unix-socket bind; neither currently obsoletes this project.
+
+**Changing the version pin** requires updating: (a) this section, (b) the version probe in layer-2 tests (§12), and (c) the CI service-container image tag in `.github/workflows/ci.yml`.
 
 ## 14. Security considerations
 
+- **Audit logging is a future enhancement** (§16). The v1 daemon does not commit to a specific structured log-line schema. Callers should not depend on log output format. See §16 for the planned richer audit capability.
 - **Report vulnerabilities privately**, not as public issues, until a fix is available. (A concrete disclosure contact/process should be added here once the project has a home — email alias, GitHub Security Advisories, etc.)
 - **The `dba_execute` keyword screen is not a formal guarantee** (§3). Treat the `dba` tier as a trusted-operator tier, not as a boundary that holds against a `dba`-tier identity actively trying to defeat it.
 - **The read-only channel's safety is an assumption about SurrealDB's own RBAC**, not something this proxy independently verifies at runtime beyond what's practical to probe at startup. Pin and test against specific SurrealDB versions (§13).
@@ -322,15 +382,156 @@ Concretely, **not** part of this project, by design:
 
 ## 16. Roadmap
 
+
 Recorded so each has a rationale on file and doesn't need re-litigating when its time comes; none of these block a first release.
 
 - **Loopback firewall rule (documentation, not code).** A host-level rule (e.g. an iptables `OUTPUT`-chain rule matching non-root UIDs) closing direct access to SurrealDB's port entirely. Pure defence in depth on top of §14 — mediated identities hold no credentials, so a direct connection already gets them nothing beyond unauthenticated health endpoints, but a firewall rule removes even that. Documented as a deployment recommendation, not shipped as project code, since it's host/firewall-tooling-specific.
 - **Batched `transact` operation.** A typed method carrying a list of write operations executed in one transaction, closing the non-atomicity of the read-then-write-by-ID idiom (§6.4). Policy check: union of all target tables across the batch.
 - **Live-query support.** A server-initiated push channel over the Unix socket, with the proxy holding a WebSocket to SurrealDB under the read-only credential and forwarding notifications. Until then, `SHOW CHANGES` polling through `query` is the substitute.
-- **Richer audit.** Metrics export (denial counts, per-identity latency), structured query logging with retention, alerting on repeated denials. The baseline (one structured log line per call) is deliberately minimal.
+- **Audit logging.** One structured log line per call (identity, method, target table(s), policy outcome, latency), plus metrics export (denial counts, per-identity latency), structured query logging with retention, and alerting on repeated denials. The log-line schema and destination (stderr, syslog, JSON-to-stdout) are to be defined when this work is picked up. This is intentionally deferred so the schema can be specified once, correctly, rather than committed to prematurely.
 - **Grant snapshots / config-as-code export.** A periodic job exporting effective `_access_group`/`_access_grant` state to a file, so runtime grant drift from any seeded defaults is reviewable in version control — recovering an as-code property for the one store that must stay runtime-mutable (§8).
 - **Multi-instance / high availability.** Running more than one proxy instance against the same SurrealDB (e.g. one per host in a multi-host deployment), sharing the same groups/grants state. No structural blocker anticipated; not validated yet.
 - **Interactive REPL** on top of the CLI (§10): statement history, completion, and routing simple write statements to the correct typed method automatically.
 - **SurrealDB 3.x compatibility testing** as a first-class, continuously-tested target alongside 2.x, once the project has CI (§13).
 - **Orphaned-grant cleanup tooling.** A command that lists (and optionally deletes) `_access_grant` rows whose `username` matches no identity in the current `config.yml`, rather than requiring a hand-written `DELETE` (§8).
 - **Declarative groups/grants seeding tool.** See §15 — deferred until demonstrated need.
+
+---
+
+## Appendix A. Grammar for `target` / `targets`
+
+The `target` (single) and `targets` (array) fields accepted by the typed write methods must match one of the following forms. Anything else is rejected with `INVALID_PARAMS` before any policy check or SurrealDB call is made.
+
+```
+target     = table_id | record_id
+
+table_id   = ident
+record_id  = ident ":" id_part
+
+ident      = [A-Za-z_][A-Za-z0-9_]*
+
+id_part    = integer
+           | string_literal          -- single- or double-quoted
+           | ulid_literal            -- ULID (26-char base32 string)
+           | uuid_literal            -- UUID (8-4-4-4-12 hex form)
+           | "{" ... "}"             -- object key — NOT accepted in v1
+           | "[" ... "]"             -- array key — NOT accepted in v1
+           | range_expr              -- NOT accepted in v1
+
+integer         = [0-9]+
+string_literal  = "'" <chars> "'" | '"' <chars> '"'
+ulid_literal    = [0-9A-Z]{26}       -- Crockford base32, 26 characters
+uuid_literal    = <8hex> "-" <4hex> "-" <4hex> "-" <4hex> "-" <12hex>
+```
+
+**What is accepted:** a bare table name (`invoice`), or a record ID with an integer (`invoice:42`), string (`invoice:'abc'`, `invoice:"abc"`), ULID (`invoice:01HXYZ...`), or UUID (`invoice:018f5e...`) key part.
+
+**What is rejected:** object keys (`invoice:{city:"NYC"}`), array keys (`invoice:[1,2,3]`), ranges (`invoice:1..10`), quoted-identifier table names (`` `my table` ``), and any whitespace in the `target` value. Record IDs with these key forms can still be *selected* via a full-SurrealQL `query` call; the typed write methods simply require an explicit, already-resolved record ID when targeting a specific row.
+
+**`targets` (plural):** an array of `target` strings following the same grammar. All elements must refer to the same table (mixing tables in a single `update` or `delete` targets array is not supported; issue one call per table). The policy check is applied to the table name derived from the first element; all elements must agree.
+
+---
+
+## Appendix B. Grammar for `where` condition objects
+
+The `where` parameter accepted by `update` and `delete` is a structured JSON object, not a SurrealQL string. The proxy compiles it into a `WHERE` clause using only bound parameters — no caller-supplied text is ever interpolated.
+
+### B.1 Grammar
+
+```
+condition   = comparison | containment | null_check
+            | { "and": [ condition, ... ] }
+            | { "or":  [ condition, ... ] }
+            | { "not": condition }
+
+comparison  = {
+    "field": field_path,
+    "op":    "=" | "!=" | "<" | "<=" | ">" | ">=",
+    "value": scalar
+}
+
+containment = {
+    "field": field_path,
+    "op":    "IN" | "NOT IN" | "CONTAINS" | "CONTAINS ANY" | "CONTAINS ALL",
+    "value": scalar | [ scalar, ... ]
+}
+
+null_check  = {
+    "field": field_path,
+    "op":    "IS NULL" | "IS NOT NULL"
+}
+
+field_path  = ident ( "." ident )*
+              -- dotted paths only; array indexing and record-link traversal
+              -- (-> / <-) are not supported in v1.
+
+scalar      = string | number | boolean | null
+```
+
+### B.2 Depth limit
+
+`and`/`or`/`not` nesting is capped at **8 levels**. Deeper trees are rejected with `INVALID_PARAMS`.
+
+### B.3 Null / type coercion
+
+- `null` in a `value` position is a typed JSON null, passed as a bound parameter. The database applies its own null/undefined semantics.
+- No implicit type coercion is performed by the proxy. A `number` value is forwarded as a number, a `string` as a string, etc.
+- Using `"op": "IS NULL"` or `"op": "IS NOT NULL"` ignores any `"value"` key present.
+
+### B.4 Empty `and`/`or` arrays
+
+An empty `and` array compiles to `TRUE` (no restriction); an empty `or` array compiles to `FALSE` (matches nothing). Both are accepted rather than rejected, to allow callers to build conditions programmatically without special-casing the zero-element case.
+
+---
+
+## Appendix C. `dba_execute` keyword screen
+
+The `dba_execute` method passes arbitrary SurrealQL to SurrealDB but first applies a **keyword screen** that rejects any statement containing identity-management or access-control keywords, regardless of context. The screen is intentionally over-rejecting: it is a safety net against accidental misuse of the `dba` tier, not a formal parse of SurrealQL.
+
+### C.1 Tokenization before screening
+
+Before checking keywords, the proxy normalises the statement text:
+
+1. Strip line comments (`--` through end-of-line).
+2. Strip block comments (`/* ... */`, non-nested).
+3. Collapse all whitespace runs (space, tab, newline, carriage-return) to a single space.
+4. Convert to upper-case.
+5. Tokenize on whitespace and the punctuation characters `;`, `(`, `)`, `,` — producing a flat list of tokens.
+
+String literals (single- and double-quoted) and backtick-quoted identifiers are **not** stripped before screening — their *contents* are not checked for keywords (a string value of `"DEFINE USER"` does not trigger the screen), but the surrounding statement text is still normalised and screened.
+
+### C.2 Reject list
+
+A `dba_execute` call is rejected with `DENIED` if the normalised token stream contains any of the following two-token sequences or single tokens:
+
+**Identity and access management (always rejected):**
+
+| Token sequence / token | Notes |
+|---|---|
+| `DEFINE USER` | All forms |
+| `REMOVE USER` | All forms |
+| `DEFINE ACCESS` | Replaces `DEFINE SCOPE`/`DEFINE TOKEN` in SurrealDB 2.x+ |
+| `REMOVE ACCESS` | |
+| `DEFINE SCOPE` | Legacy SurrealDB 1.x form; reject for defence in depth |
+| `REMOVE SCOPE` | |
+| `DEFINE TOKEN` | Legacy SurrealDB 1.x form |
+| `REMOVE TOKEN` | |
+| `SIGNUP` | Embedded in SurrealQL `DEFINE ACCESS ... WITH SIGNUP` blocks |
+| `SIGNIN` | Embedded in SurrealQL `DEFINE ACCESS ... WITH SIGNIN` blocks |
+
+**Additions to the reject list** are welcome (raise a PR, no issue required). **Removals** require an issue, explicit rationale, and human review before merging — they widen the DBA tier's authority.
+
+### C.3 What is permitted
+
+All DDL not in §C.2 is permitted for `dba`-tier callers, including:
+
+- `DEFINE / REMOVE TABLE`, `DEFINE / REMOVE FIELD`, `DEFINE / REMOVE INDEX`, `DEFINE / REMOVE EVENT`, `DEFINE / REMOVE FUNCTION`, `DEFINE / REMOVE PARAM`, `DEFINE / REMOVE ANALYZER`
+- `DEFINE / REMOVE NAMESPACE`, `DEFINE / REMOVE DATABASE`
+- `DEFINE / REMOVE API` (SurrealDB 3.x)
+- Arbitrary DML: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `RELATE`, `UPSERT`
+- Transactions: `BEGIN TRANSACTION` / `COMMIT TRANSACTION` / `CANCEL TRANSACTION`
+- `INFO FOR ...`, `SHOW CHANGES`, `LIVE SELECT` (live queries not supported end-to-end in v1 — see §16)
+
+### C.4 Caveats
+
+The screen tokenizes on whitespace and common punctuation. A pathological statement that avoids spaces between the keyword and its arguments (e.g. `DEFINE/**/USER`) would defeat it. This is considered an acceptable limitation: the `dba` tier is a trusted-operator tier (§3), and constructing such a bypass is evidence of deliberate circumvention, which is outside the proxy's threat model.
