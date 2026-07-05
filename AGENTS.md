@@ -4,12 +4,6 @@ Guidance for AI coding agents working on this repository. Read this before makin
 
 ---
 
-## Why this file matters
-
-This project exists to constrain what AI agents and scripts can do to a database. An agent working on the codebase itself, without explicit guidance, is likely to reach for exactly the anti-patterns the design prevents: interpolating SurrealQL strings, adding "convenience" methods that bypass the typed write surface, relaxing "over-strict" validation, or helpfully exposing a TCP or WebSocket listener. This file is the countermeasure.
-
----
-
 ## Ground rules (override any default instinct)
 
 1. **Never interpolate a caller-supplied string into SurrealQL text.** Bound parameters only, always. See SPEC §6.4. A single interpolation gap is a policy bypass.
@@ -17,7 +11,7 @@ This project exists to constrain what AI agents and scripts can do to a database
 3. **Never widen the `dba_execute` keyword screen.** Additions to the reject list (SPEC Appendix C) are welcome; removals require a filed issue, explicit rationale, and human review. The screen over-rejects on purpose.
 4. **Never add a TCP listener, WebSocket listener, or any transport on the caller side that is not a Unix domain socket.** The Unix socket is the identity mechanism — a TCP or WebSocket listener destroys it. If a change seems to require one, stop and ask.
 5. **Never log full request payloads, credential values, or bound-parameter contents at any level below debug.** SPEC §14.
-6. **Do not generate or modify `SPEC.md`, `SECURITY.md`, `CHANGELOG.md`, or this file (`AGENTS.md`) proactively.** Those are human-maintained. Update `SPEC.md` in the same commit as a behaviour change, but only for the specific section(s) affected.
+6. **Do not generate or modify `SPEC.md`, `SECURITY.md`, `CHANGELOG.md`, or this file (`AGENTS.md`) *proactively*.** Those are human-maintained. "Proactively" means without being asked: it is fine — expected, even — to edit any of these files, including this one, when a human explicitly asks for it in the conversation. Update `SPEC.md` in the same commit as a behaviour change, but only for the specific section(s) affected.
 
 ---
 
@@ -85,21 +79,16 @@ make test-conformance # Layer 4 only
 make test-multiuser   # Layer 3 — disposable container/VM only
 ```
 
-Go tests also run directly:
-```sh
-go test ./...
-cd client-python && python3 -m pytest tests/
-```
-
 ---
 
 ## The SurrealDB version pin and how to change it
 
-The minimum required version is **SurrealDB 3.1.5** (SPEC §13). This pin exists to exclude all versions affected by `GHSA-4vgr-h27g-cf9p`. Changing it requires updating **all three** of:
+The minimum required version is **SurrealDB 3.1.5** (SPEC §13). This pin exists to exclude all versions affected by `GHSA-4vgr-h27g-cf9p`. Changing it requires updating **all four** of:
 
 1. `SPEC.md` §13 — the minimum version statement.
-2. The version probe / service-container tag in `.github/workflows/ci.yml`.
-3. `Makefile` — `SURREALDB_MIN_VERSION` variable.
+2. The version probe in the layer-2 integration tests (SPEC §12).
+3. The service-container image tag in `.github/workflows/ci.yml`.
+4. `Makefile` — `SURREALDB_MIN_VERSION` variable.
 
 Do not change any one of these without changing the others.
 
@@ -107,13 +96,7 @@ Do not change any one of these without changing the others.
 
 ## External state to watch
 
-If any of the following changes, update SPEC §1 and §13 and consider whether the design premise still holds:
-
-| Item | Why it matters |
-|---|---|
-| [`surrealdb/surrealdb#1614`](https://github.com/surrealdb/surrealdb/issues/1614) — Unix-socket transport | If this ships, the identity mechanism may become unnecessary |
-| [`surrealdb/surrealdb#7092`](https://github.com/surrealdb/surrealdb/issues/7092) — table-level `DEFINE USER` | If this ships, the proxy's entire reason for existing may go away |
-| [`GHSA-4vgr-h27g-cf9p`](https://github.com/advisories/GHSA-4vgr-h27g-cf9p) — HTTP RPC session TOCTOU | The version pin exists because of this; watch for new advisories in the same class |
+The upstream issues and advisory motivating this project, and why the design depends on them, are listed in README.md ("Reference links") and SPEC §1/§13/§16. If any of them change — especially `surrealdb/surrealdb#1614` (Unix-socket transport) or `#7092` (table-level `DEFINE USER`) shipping, or a new advisory in the same class as `GHSA-4vgr-h27g-cf9p` — update SPEC §1 and §13 and reconsider whether the design premise still holds.
 
 ---
 
@@ -129,7 +112,7 @@ If any of the following changes, update SPEC §1 and §13 and consider whether t
 
 ## What NOT to do proactively
 
-- Do not create additional documentation files. The maintained set is: `README.md`, `SPEC.md`, `SECURITY.md`, `CHANGELOG.md`, `AGENTS.md`.
+- Do not create additional documentation files unless a human explicitly asks for one. The maintained set is: `README.md`, `SPEC.md`, `SECURITY.md`, `CHANGELOG.md`, `AGENTS.md`.
 - Do not add example clients beyond Go (`client/`) and Python (`client-python/`).
 - Do not add REPL support, batched `transact`, or live-query support — those are SPEC §16 roadmap items.
 - Do not add a `--allow-tcp` or similar flag that re-opens the identity problem the project is built to solve.
